@@ -1,0 +1,37 @@
+# Deployment requirements
+# File: /deployment/requirements.txt
+Create comprehensive requirements file with pinned versions:
+
+Core dependencies:
+- Flask==2.3.3 (API framework)
+- Streamlit==1.28.1 (dashboard)
+- pandas==2.1.3, numpy==1.24.3 (data manipulation)
+- scikit-learn==1.3.2 (machine learning)
+- xgboost==1.7.6 (ensemble model)
+- lightgbm==4.1.0 (existing model)
+- shap==0.43.0 (explainability)
+
+Data sources:
+- yfinance==0.2.22 (Yahoo Finance API)
+- requests==2.31.0 (HTTP requests for APIs)
+- openai==1.3.7 (GPT integration)
+
+Visualization:
+- plotly==5.17.0 (interactive charts)
+- matplotlib==3.8.2 (static plots)
+
+Database & Caching:
+- SQLAlchemy==2.0.23 (database ORM)
+- redis==5.0.1 (caching)
+- psycopg2-binary==2.9.9 (PostgreSQL connector)
+
+Production:
+- gunicorn==21.2.0 (WSGI server)
+- supervisord==4.2.5 (process management)
+
+Development:
+- pytest==7.4.3 (testing)
+- black==23.11.0 (code formatting)
+- flake8==6.1.0 (linting)
+
+Include version constraints to ensure reproducible builds.
