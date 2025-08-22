@@ -1,5 +1,1 @@
-# System packages for Streamlit deployment can be listed here.
-# For example:
-# libgomp1
-# For this project, no special system packages are required.
 
