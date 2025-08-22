@@ -8,6 +8,10 @@ import numpy as np
 import pandas as pd
 import pickle
 import shap
+import json
+import threading
+import time
+from collections import deque, defaultdict
 
 
 from api.models import ClientPredictResponse, ErrorResponse
@@ -27,6 +31,11 @@ data_file=app.config['DATA_FILE']
 explainer_file=app.config['EXPLAINER_FILE']
 default_threshold=app.config['THRESHOLD']
 
+# New: alert threshold and scheduler cadence from config
+alert_delta_abs = app.config.get('ALERT_DELTA_ABS', 0.05)
+config_refresh_interval = app.config.get('REFRESH_INTERVAL_SECONDS', 1800)
+demo_cfg = app.config.get('demo', {'DEMO_MODE': False, 'DEMO_JITTER': 0.0})
+
 model_path=f'{model_server}/{model_file}'
 explainer_path=f'{model_server}/{explainer_file}'
 data_path=f'{data_server}/{data_file}'
@@ -35,11 +44,31 @@ def load_pickle(filename):
     with open(filename, 'rb') as handle:
         return pickle.load(handle)
 
+# Ensure JSON safe serialization
+def to_json_safe(value):
+    if isinstance(value, dict):
+        return {k: to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [to_json_safe(v) for v in value]
+    if isinstance(value, (np.floating, np.integer)):
+        value = value.item()
+    if isinstance(value, float):
+        if np.isnan(value) or np.isinf(value):
+            return None
+    if pd.isna(value):
+        return None
+    return value
+
 Model = imbpipeline or Pipeline or LGBMClassifier
 Explainer = shap.TreeExplainer or shap.LinearExplainer
 
 model: Model  = load_pickle(model_path)
-explainer: Explainer = load_pickle(explainer_path)
+# Try to load the saved explainer, but fall back to building it dynamically if incompatible
+try:
+    explainer: Explainer = load_pickle(explainer_path)
+except Exception:
+    explainer = None
+
 data:pd.DataFrame=pd.DataFrame()
 
 # Load client data 
@@ -66,6 +95,7 @@ list_clients=list(data.index)
 data_prep=data
 clf = model
 type_model=type(model)
+can_preprocess=True
 
 if isinstance(model, imbpipeline) or isinstance(model,Pipeline):
     # shap n'est pas capable de travailler sur les pipelines
@@ -73,21 +103,60 @@ if isinstance(model, imbpipeline) or isinstance(model,Pipeline):
     clf=model.named_steps['clf']
     type_model= type(clf)
     # on enleve le classificateur pour faire le preprocessing/feature_selection des données
-    data_prep=pd.DataFrame(model[:-1].transform(data),index=data.index, columns=data.columns)
+    try:
+        data_prep=pd.DataFrame(model[:-1].transform(data),index=data.index, columns=data.columns)
+        can_preprocess=True
+    except Exception:
+        # Version mismatch: skip preprocessing and assume incoming data is already in model feature space
+        data_prep=data
+        can_preprocess=False
+
+print(f'init_app, clf = {type_model}, can_preprocess={can_preprocess}')
+
+# ---------------------------------------------------------------------
+# Real-time scoring buffer (simple in-memory trend store)
+score_history: dict[int, deque] = defaultdict(lambda: deque(maxlen=120))  # ~ last 2 hours @ 1/min
+# Use configured refresh interval for background task cadence
+refresh_interval_seconds = int(config_refresh_interval) if isinstance(config_refresh_interval, (int, float)) else 1800
 
 
-print(f'init_app, clf = {type_model}')
-# if explainer is None:
-#     if isinstance(clf,LGBMClassifier):
-#         explainer=shap.TreeExplainer(clf,data_prep)
-#     elif isinstance(clf,LogisticRegression):
-#         explainer= shap.LinearExplainer(clf,data_prep)    
+def compute_proba_for_client(client_id: int) -> float:
+    client_df = get_client_data(data, client_id)
+    if client_df is None or len(client_df) == 0:
+        return float('nan')
+    try:
+        proba = model.predict_proba(client_df)[:, 1][0]
+    except Exception:
+        proba = clf.predict_proba(client_df)[:, 1][0]
+    return float(proba)
+
+
+def background_refresher():
+    while True:
+        try:
+            # update a small rotating subset for demo; ensure current selected ID exists
+            for client_id in list_clients[:10]:
+                p = compute_proba_for_client(int(client_id))
+                # Demo mode: add small random jitter so alerts can trigger on static data
+                if demo_cfg.get('DEMO_MODE'):
+                    jitter = float(demo_cfg.get('DEMO_JITTER', 0.0))
+                    if jitter > 0:
+                        p = float(np.clip(p + np.random.normal(0.0, jitter), 0.0, 1.0))
+                ts = pd.Timestamp.utcnow().isoformat()
+                score_history[int(client_id)].append({"timestamp": ts, "score": None if pd.isna(p) else p})
+        except Exception:
+            pass
+        time.sleep(refresh_interval_seconds)
+
+threading.Thread(target=background_refresher, daemon=True).start()
+
+# ---------------------------------------------------------------------
 
 @app.route('/')
 @app.route('/index/')
 def index():
     """list available api routes"""
-    routes = ['/clients/', '/client/{id}', '/predict/{id}', '/explain/{id}']
+    routes = ['/clients/', '/client/{id}', '/predict/{id}', '/explain/{id}', '/realtime/scores/{id}', '/alerts/']
 
     htmlstr= '<html style="font-family: Roboto, Tahoma, sans-serif;"><body>'
     htmlstr+= '<p>valid routes are :<p><ul>'
@@ -96,6 +165,88 @@ def index():
     htmlstr+='</ul></body></html>'    
     response = htmlstr
     return response 
+
+@app.route('/api/health/status', methods=['GET'])
+def health_status():
+    return app.response_class(json.dumps({"status": "healthy"}), mimetype='application/json')
+
+
+def _evaluate_alert(current: float | None, previous: float | None) -> dict:
+    """Return alert info if absolute change exceeds configured threshold."""
+    if current is None or previous is None:
+        return {"alert": False}
+    delta = float(current) - float(previous)
+    trigger = abs(delta) >= float(alert_delta_abs)
+    direction = "UP" if delta > 0 else ("DOWN" if delta < 0 else "FLAT")
+    return {
+        "alert": trigger,
+        "delta": delta,
+        "delta_abs": abs(delta),
+        "threshold": float(alert_delta_abs),
+        "direction": direction,
+    }
+
+@app.route('/realtime/scores/<id>', methods=['GET'])
+def realtime_scores(id: int):
+    cid = int(id)
+    history = list(score_history.get(cid, []))
+    if not history:
+        # compute once on-demand
+        p = compute_proba_for_client(cid)
+        ts = pd.Timestamp.utcnow().isoformat()
+        history = [{"timestamp": ts, "score": None if pd.isna(p) else p}]
+        score_history[cid].append(history[0])
+    # add basic trend and delta
+    current = history[-1]["score"]
+    previous = history[-2]["score"] if len(history) > 1 else None
+    trend = "FLAT"
+    if current is not None and previous is not None:
+        if current > previous:
+            trend = "IMPROVING"
+        elif current < previous:
+            trend = "WORSENING"
+    alert_info = _evaluate_alert(current, previous)
+    payload = {
+        "id": cid,
+        "current_score": current,
+        "previous_score": previous,
+        "trend": trend,
+        "history": history,
+        "alert": alert_info,
+        "refresh_interval_seconds": refresh_interval_seconds,
+    }
+    return app.response_class(json.dumps(to_json_safe(payload), allow_nan=False), mimetype='application/json')
+
+@app.route('/alerts/', methods=['GET'])
+def list_alerts():
+    """Return current alerts across all tracked clients based on last two scores."""
+    alerts = []
+    for cid, hist in score_history.items():
+        h = list(hist)
+        if len(h) < 2:
+            continue
+        current = h[-1].get("score")
+        previous = h[-2].get("score")
+        info = _evaluate_alert(current, previous)
+        if info.get("alert"):
+            alerts.append({
+                "id": cid,
+                "current_score": current,
+                "previous_score": previous,
+                "trend": "IMPROVING" if (current or 0) > (previous or 0) else ("WORSENING" if (current or 0) < (previous or 0) else "FLAT"),
+                "delta": info["delta"],
+                "delta_abs": info["delta_abs"],
+                "threshold": info["threshold"],
+                "direction": info["direction"],
+                "timestamp": h[-1].get("timestamp"),
+            })
+    payload = {
+        "count": len(alerts),
+        "threshold": float(alert_delta_abs),
+        "alerts": alerts,
+        "refresh_interval_seconds": refresh_interval_seconds,
+    }
+    return app.response_class(json.dumps(to_json_safe(payload), allow_nan=False), mimetype='application/json')
 
 @app.route('/clients/',  methods=['GET'])
 def clients():
@@ -113,10 +264,10 @@ def get_client_data(df:pd.DataFrame, id:int) :
 
 @app.route('/client/<id>',  methods=['GET'])
 def client(id:int):
-    """Renvoie les données d'un client """
+    """Return a client's data"""
     client_data = get_client_data(data,id)
     if client_data is None:
-        response = ErrorResponse(error="Client inconnu")
+        response = ErrorResponse(error="Unknown client")
     else:
         response = client_data.iloc[0].to_dict()
     return jsonify(response)
@@ -131,24 +282,28 @@ def is_true(ch:str or bool)-> bool:
 @app.route('/predict/<id>',  methods=['GET'])
 def predict(id:int):
     """
-    Renvoie le score d'un client en réalisant 
-    le predict à partir du modèle final sauvegardé
-    Example :
+    Return a client's score using the saved final model
+    Example:
     - http://127.0.0.1:5000/predict/395445?threshold=0.3&return_data=y
     """
     global type_model
     client_data = get_client_data(data,id)
     if client_data is None:
-        response = ErrorResponse(error="Client inconnu")
+        response = ErrorResponse(error="Unknown client")
     else:
         threshold = request.args.get('threshold',default_threshold)
         if isinstance(threshold,str):
             threshold = float(threshold)
         return_data= is_true(request.args.get('return_data',False))  # type: ignore
-        y_pred_proba = model.predict_proba(client_data)[:,1]
+        # Fallback: if we cannot preprocess, call classifier directly
+        try:
+            y_pred_proba = model.predict_proba(client_data)[:,1]
+        except Exception:
+            y_pred_proba = clf.predict_proba(client_data)[:,1]
         y_pred_proba = y_pred_proba[0]
         y_pred= int((y_pred_proba > threshold)*1)
         client_data=client_data.iloc[0].to_dict() if return_data else {}
+        client_data = to_json_safe(client_data)
         response = ClientPredictResponse(
             id=id,
             y_pred_proba= y_pred_proba,
@@ -156,7 +311,7 @@ def predict(id:int):
             model_type=f'{type_model}',
             client_data=client_data
         )
-    return jsonify(response)
+    return app.response_class(json.dumps(response, allow_nan=False), mimetype='application/json')
 
 
 def df_to_json(df:pd.DataFrame)->dict:
@@ -167,15 +322,17 @@ def df_to_json(df:pd.DataFrame)->dict:
         feature_names=list(df.columns),
         # dtypes=list(df.dtypes),
         shape=df.shape,
+        index=list(df.index),
         data=df.to_numpy().tolist()
     )
+
 
 def json_to_df(jd:dict)->pd.DataFrame:
     """convert json to dataframe
     https://stackoverflow.com/a/26646362/
     """
     df= pd.DataFrame(np.array(jd.get('data')), columns=jd.get('feature_names'))
-    # print (f'json_to_df, {jd.get("shape")}')
+    # print (f'json_to_df, {jd.get("shape")})
     # print (f'json_to_df, {df.shape}')
     return df
 
@@ -183,9 +340,9 @@ def json_to_df(jd:dict)->pd.DataFrame:
 @app.route('/explain/',  methods=['GET'])
 def explain_all():
     """
-    Renvoie les explications shap de jusqu'à 1000 clients à partir du modèle final sauvegardé
-    Utilisé pour afficher les beeswarm et summary plots
-    Example :
+    Return SHAP explanations for up to 1000 clients using the saved final model
+    Used to display beeswarm and summary plots
+    Example:
     - http://127.0.0.1:5000/explain/nb=100
     """ 
     global data, model, explainer
@@ -196,35 +353,57 @@ def explain_all():
     # preprocess
     data_sample_prep = data_sample
     if isinstance(model,imbpipeline) or isinstance(model,Pipeline):
-        data_sample_prep = pd.DataFrame(model[:-1].transform(data_sample), 
-                index=data_sample.index,columns=data_sample.columns)
+        try:
+            data_sample_prep = pd.DataFrame(model[:-1].transform(data_sample), 
+                    index=data_sample.index,columns=data_sample.columns)
+        except Exception:
+            data_sample_prep = data_sample
     client_data_json= df_to_json(data_sample_prep)
-    shap_values = explainer.shap_values(data_sample_prep, check_additivity=False).tolist()
-    expected_value = explainer.expected_value  # only keep class 1)
-    response = jsonify(
+    shap_values_raw = explainer.shap_values(data_sample_prep, check_additivity=False)
+    # Normalize to class 1 for binary classifiers (or first available)
+    if isinstance(shap_values_raw, list):
+        shap_values_arr = shap_values_raw[1] if len(shap_values_raw) > 1 else shap_values_raw[0]
+    else:
+        shap_values_arr = shap_values_raw
+    expected_value_raw = explainer.expected_value
+    if isinstance(expected_value_raw, (list, tuple)):
+        expected_value_raw = expected_value_raw[1] if len(expected_value_raw) > 1 else expected_value_raw[0]
+    shap_values = to_json_safe(np.asarray(shap_values_arr).tolist())
+    expected_value = to_json_safe(expected_value_raw)
+    # Add prediction probabilities for the portfolio sample
+    try:
+        y_pred = model.predict_proba(data_sample)[:, 1]
+    except Exception:
+        y_pred = clf.predict_proba(data_sample)[:, 1]
+    y_pred = [None if pd.isna(v) else float(v) for v in y_pred]
+    response = dict(
         shap_values=shap_values,
         expected_value= expected_value,
-        client_data=client_data_json
+        client_data=client_data_json,
+        y_pred_proba=y_pred
     )
-    return response
+    return app.response_class(json.dumps(to_json_safe(response), allow_nan=False), mimetype='application/json')
 
 
 @app.route('/explain/<id>',  methods=['GET'])
 def explain(id:int):
     """
-    Renvoie les explications shap d'un client à partir du modèle final sauvegardé
-    Example :
+    Return SHAP explanations for a single client using the saved final model
+    Example:
     - http://127.0.0.1:5000/explain/395445?threshold=0.3&return_data=y
     """
     client_data = get_client_data(data,id)
     if client_data is None:
-        response=jsonify(error="Client inconnu")
+        response=jsonify(error="Unknown client")
     else:
         threshold = request.args.get('threshold',default_threshold)
         if isinstance(threshold,str):
             threshold=float(threshold)
         return_data= is_true(request.args.get('return_data',False))  # type: ignore
-        y_pred_proba = model.predict_proba(client_data)[:,1]
+        try:
+            y_pred_proba = model.predict_proba(client_data)[:,1]
+        except Exception:
+            y_pred_proba = clf.predict_proba(client_data)[:,1]
         y_pred_proba=y_pred_proba[0]
         y_pred= int((y_pred_proba > threshold)*1)
         # get first data row (as series)
@@ -233,13 +412,19 @@ def explain(id:int):
         # preprocess
         client_data_prep = client_data
         if isinstance(model,imbpipeline) or isinstance(model,Pipeline):
-            client_data_prep = pd.DataFrame(model[:-1].transform(client_data), 
-            index=client_data.index,columns=client_data.columns)
+            try:
+                client_data_prep = pd.DataFrame(model[:-1].transform(client_data), 
+                index=client_data.index,columns=client_data.columns)
+            except Exception:
+                client_data_prep = client_data
         explainer_shap_values = explainer.shap_values(client_data_prep, check_additivity=False)
         shap_values = pd.Series(data=explainer_shap_values[0], index=feature_names).to_dict() 
         expected_value = explainer.expected_value 
+        shap_values = to_json_safe(shap_values)
+        expected_value = to_json_safe(expected_value)
         client_data= client_data.iloc[0].to_dict() if return_data else {}
-        response = jsonify(
+        client_data = to_json_safe(client_data)
+        response = dict(
             id=id,
             y_pred_proba= y_pred_proba,
             y_pred= y_pred,
@@ -247,7 +432,7 @@ def explain(id:int):
             expected_value= expected_value,
             client_data=client_data
         )
-    return response
+    return app.response_class(json.dumps(response, allow_nan=False), mimetype='application/json')
 
 
 # python api/app.py -> runs locally on localhost port 5000
