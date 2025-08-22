@@ -1,0 +1,2 @@
+# System packages for Streamlit deployment
+# Usually not needed for basic apps, but included for completeness
