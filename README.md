@@ -1,13 +1,11 @@
 # CredTech: Real-Time Explainable Credit Intelligence Platform
 
-## File: /docs/README.md
+## 🚀 Live Demo
 
-```markdown
-# CredTech: Real-Time Explainable Credit Intelligence Platform
+**🌟 [Access Live Application](https://adfrge.streamlit.app)**
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
-[![Docker](https://img.shields.io/badge/docker-ready-blue)]()
-[![License](https://img.shields.io/badge/license-MIT-green)]()
+
+The CredTech platform is successfully deployed on Streamlit Cloud with real-time credit risk analytics capabilities. The deployment features optimized performance with Python 3.9 runtime for maximum compatibility.
 
 ## 🎯 Project Overview
 
@@ -72,6 +70,29 @@ External APIs → Data Collectors → Feature Engineering → ML Engine → Expl
 [Alpha Vantage] [Processor]     [Normalization]  [Uncertainty] [Narratives]  [Mobile]
 [News API]      [NLP Engine]    [Lag Features]   [Drift Detect] [Comparisons] [Export]
 ```
+
+---
+
+## 🏆 Deployment & Hackathon Details
+
+### Production Deployment Status
+- **Live Demo:** [https://adfrge.streamlit.app](https://adfrge.streamlit.app)
+- **Platform:** Streamlit Cloud with optimized runtime
+- **Python Version:** 3.9 (selected for maximum package compatibility)
+- **Deployment Strategy:** Minimal viable product with incremental feature addition
+- **Status:** ✅ Successfully deployed with real-time functionality
+
+### Hackathon Competition Strategy
+- **Target Evaluation:** Real-world business impact with technical excellence
+- **Innovation Focus:** Explainable AI meets real-time financial intelligence
+- **Differentiator:** First transparent credit platform with sub-minute updates
+- **Market Advantage:** Addresses $4.2T credit market transparency gap
+
+### Team Information
+- **Repository:** IIT_hackathon/AshutoshMore142k4
+- **Branch:** dashboard-development (latest features)
+- **Development:** Agile with continuous deployment
+- **Documentation:** Comprehensive technical and business documentation
 
 ---
 
